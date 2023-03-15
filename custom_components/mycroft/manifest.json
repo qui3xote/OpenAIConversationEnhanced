@@ -1,0 +1,12 @@
+{
+  "domain": "mycroft_conversation",
+  "name": "Mycroft Conversation",
+  "codeowners": ["@qui3xote"],
+  "config_flow": true,
+  "version": "0.0.1",
+  "dependencies": ["conversation"],
+  "documentation": "",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "requirements": ["openai==0.27.2"]
+}
