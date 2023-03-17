@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from functools import partial
+from types import Optional, Tuple, List
 import logging
 import json
+from asyncio import gather
 
 import openai
 from openai import error
@@ -13,7 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady, TemplateError
-from homeassistant.helpers import area_registry as ar, intent, service, template
+from homeassistant.helpers import area_registry as ar, intent, template
 from homeassistant.util import ulid
 
 from .const import (
@@ -75,38 +77,58 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
-        """Process a sentence."""
-        system_prompt = self.entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
+        new_message = {
+            "role": "user",
+            "content": user_input.text + " Answer in syntactically perfect json only",
+        }
+
+        # Generate conversation history
+        conversation_id, messages = self.generate_conversation_history(
+            user_input, new_message
+        )
+
+        # Get model and other parameters
         model = self.entry.options.get(CONF_MODEL, DEFAULT_MODEL)
         max_tokens = self.entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
         top_p = self.entry.options.get(CONF_TOP_P, DEFAULT_TOP_P)
         temperature = self.entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
-        new_message = {
-            "role": "user",
-            "content": user_input.text
-            + " Answer in syntactially perfect json and only json,",
-        }
 
+        # Execute OpenAI API call
+        result = await self.execute_openai_api_call(
+            model, messages, max_tokens, top_p, temperature, conversation_id
+        )
+
+        # Parse OpenAI API response
+        response = result["choices"][0]["message"]["content"]
+        comment, command, error_message = self.parse_openai_response(response)
+
+        # Handle response parsing error
+        if error_message:
+            return self.create_conversation_result(
+                comment, conversation_id, user_input.language
+            )
+
+        # Execute commands received from the API response
+        error_message = await self.execute_commands(command)
+        if error_message:
+            return self.create_conversation_result(
+                error_message, conversation_id, user_input.language
+            )
+
+        return self.create_conversation_result(
+            comment, conversation_id, user_input.language
+        )
+
+    def generate_conversation_history(
+        self, user_input: conversation.ConversationInput, new_message: dict
+    ) -> Tuple[str, List[dict]]:
         if user_input.conversation_id in self.history:
             conversation_id = user_input.conversation_id
             messages = self.history[conversation_id] + [new_message]
         else:
-            try:
-                home_info_prompt = self._async_generate_prompt(HOME_INFO_TEMPLATE)
-            except TemplateError as err:
-                _LOGGER.error("Error rendering prompt: %s", err)
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    f"Sorry, I had a problem with my template: {err}",
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-
             conversation_id = ulid.ulid()
-            _LOGGER.info("System Prompt: {system_prompt}")
-            _LOGGER.info("Home Info: {home_info_prompt}")
+            system_prompt = self.entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
+            home_info_prompt = self._async_generate_home_info_prompt(HOME_INFO_TEMPLATE)
             messages = [
                 {"role": "user", "content": system_prompt},
                 {"role": "assistant", "content": '{"comment":"Ok!"}'},
@@ -114,95 +136,67 @@ class OpenAIAgent(conversation.AbstractConversationAgent):
                 {"role": "assistant", "content": '{"comment":"Got it!"}'},
                 new_message,
             ]
+            self.history[conversation_id] = messages
 
-        user_name = "User"
-        if (
-            user_input.context.user_id
-            and (
-                user := await self.hass.auth.async_get_user(user_input.context.user_id)
-            )
-            and user.name
-        ):
-            user_name = user.name
+        return conversation_id, messages
 
-        # prompt += f"\n{user_name}: {user_input.text}\nSmart home: "
-
-        # _LOGGER.info("Prompt for %s: %s", model, prompt)
-
+    def _async_generate_home_info_prompt(self, raw_prompt: str) -> str:
         try:
-            result = await openai.ChatCompletion.acreate(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                top_p=top_p,
-                temperature=temperature,
-                user=conversation_id,
+            return template.Template(raw_prompt, self.hass).async_render(
+                {
+                    "ha_name": self.hass.config.location_name,
+                    "areas": list(ar.async_get(self.hass).areas.values()),
+                },
+                parse_result=False,
             )
-        except error.OpenAIError as err:
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_error(
-                intent.IntentResponseErrorCode.UNKNOWN,
-                f"Sorry, I had a problem talking to OpenAI: {err}",
-            )
-            return conversation.ConversationResult(
-                response=intent_response, conversation_id=conversation_id
-            )
+        except TemplateError as err:
+            _LOGGER.error("Error rendering prompt: %s", err)
+            raise
 
-        _LOGGER.info("Response %s", result)
-        response = result["choices"][0]["message"]["content"]
-        self.history[conversation_id] = messages + [
-            {"role": "assistant", "content": response}
-        ]
-
+    def parse_openai_response(
+        self, response: str
+    ) -> Tuple[str, Optional[dict], Optional[str]]:
         try:
             if response[-2:] == ",}":
-                response = response[-2:] + "}"
+                response = response[:-2] + "}"
 
             response_json = json.loads(response)
             comment = response_json["comment"]
+            command = response_json.get("command", None)
         except Exception as err:
             comment = f"Unable to parse: {response} \n Error: {err}"
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_speech(comment)
+            command = None
+            error_message = str(err)
 
-            return conversation.ConversationResult(
-                response=intent_response, conversation_id=conversation_id
-            )
+        return comment, command, error_message
 
+    async def execute_commands(self, command: dict) -> Optional[str]:
         try:
-            if (
-                "command" in response_json.keys()
-                and type(response_json["command"]) == dict
-            ):
+            if type(command) == dict:
                 await self.hass.services.async_call(
-                    response_json["command"]["domain"],
-                    response_json["command"]["service"],
-                    response_json["command"]["data"],
+                    command["domain"], command["service"], command["data"]
+                )
+            elif type(command) == list:
+                await gather(
+                    *[
+                        self.hass.services.async_call(
+                            cmd["domain"], cmd["service"], cmd["data"]
+                        )
+                        for cmd in command
+                    ]
                 )
         except Exception as err:
-            comment = f"""Unable to execute: {response_json["command"]['domain'], 
-                    response_json["command"]['service'],  
-                   response_json["command"]['data']} \n Error: {err}"""
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_speech(comment)
+            error_message = f"""Unable to execute: {command['domain'], 
+                command['service'], command['data']} \n Error: {err}"""
+            return error_message
+        return None
 
-            return conversation.ConversationResult(
-                response=intent_response, conversation_id=conversation_id
-            )
-
-        intent_response = intent.IntentResponse(language=user_input.language)
-        intent_response.async_set_speech(comment)
+    def create_conversation_result(
+        self, message: str, conversation_id: str, language: str
+    ) -> conversation.ConversationResult:
+        intent_response = intent.IntentResponse(language=language)
+        intent_response.async_set_speech(message)
 
         return conversation.ConversationResult(
             response=intent_response, conversation_id=conversation_id
-        )
-
-    def _async_generate_prompt(self, raw_prompt: str) -> str:
-        """Generate a prompt for the user."""
-        return template.Template(raw_prompt, self.hass).async_render(
-            {
-                "ha_name": self.hass.config.location_name,
-                "areas": list(ar.async_get(self.hass).areas.values()),
-            },
-            parse_result=False,
         )
